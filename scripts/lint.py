@@ -1,8 +1,9 @@
 """
 Lint the knowledge base for structural and semantic health.
 
-Runs 7 checks: broken links, orphan pages, orphan sources, stale articles,
-contradictions (LLM), missing backlinks, and sparse articles.
+Runs 8 checks: broken links, orphan pages, orphan sources, stale articles,
+date-staleness (personal memory), contradictions (LLM), missing backlinks,
+and sparse articles.
 
 Usage:
     uv run python lint.py                    # all checks
@@ -13,9 +14,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
+from datetime import date, timedelta
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import (
+    KNOWLEDGE_DIR,
+    PERSONAL_MEMORY_DIR,
+    REPORTS_DIR,
+    WORKSPACE_ROOT,
+    now_iso,
+    today_iso,
+)
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -126,6 +136,117 @@ def check_missing_backlinks() -> list[dict]:
                         "detail": f"[[{source_link}]] links to [[{link}]] but not vice versa",
                         "auto_fixable": True,
                     })
+    return issues
+
+
+# ── Date-staleness (personal recall memory) ──────────────────────────────
+# Catches the failure mode where a memory entry or index hook says something
+# like "Monday 06-22 = agree scope" and that date is now in the past, so the
+# entry reads as a pending commitment that already happened. Deterministic
+# regex, no LLM. A past date alone is fine (historical record); it is only
+# flagged when paired with a future-tense marker on the same line.
+
+# Whole-word future-tense markers (so "agree" does not match "agreement").
+_MARKER_RE = re.compile(
+    r"\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
+    r"|\b(?:goal|agree|re-?check|next step|deadline|due|upcoming|to-?do|will)\b",
+    re.IGNORECASE,
+)
+
+# A date preceded by one of these is a record stamp, not a pending commitment.
+_STAMP_RE = re.compile(
+    r"(?:confirmed|status|as of|updated|dated|posted|created|logged|recorded)\W*$",
+    re.IGNORECASE,
+)
+
+_ISO_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")        # 2026-06-22
+_DOT_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{2}\b")  # 06.22.26 (workspace std)
+_DASH3_RE = re.compile(r"\b\d{1,2}-\d{1,2}-\d{2}\b")  # 06-22-26
+_MD_RE = re.compile(r"\b\d{1,2}-\d{1,2}\b")           # 06-22 (year inferred)
+
+
+def _token_to_date(token: str, today: date) -> date | None:
+    """Parse a date token to a date. Bare MM-DD infers the year: current year,
+    rolled back one if that would land more than ~6 months in the future."""
+    try:
+        if _ISO_RE.fullmatch(token):
+            y, m, d = (int(x) for x in token.split("-"))
+            return date(y, m, d)
+        if _DOT_RE.fullmatch(token):
+            m, d, yy = (int(x) for x in token.split("."))
+            return date(2000 + yy, m, d)
+        if _DASH3_RE.fullmatch(token):
+            m, d, yy = (int(x) for x in token.split("-"))
+            return date(2000 + yy, m, d)
+        if _MD_RE.fullmatch(token):
+            m, d = (int(x) for x in token.split("-"))
+            cand = date(today.year, m, d)
+            if cand - today > timedelta(days=180):
+                cand = date(today.year - 1, m, d)
+            return cand
+    except ValueError:
+        return None
+    return None
+
+
+def find_stale_dated_commitments(content: str, today: date) -> list[dict]:
+    """Find lines with a past date next to a future-tense marker."""
+    findings = []
+    for lineno, line in enumerate(content.splitlines(), start=1):
+        if not _MARKER_RE.search(line):
+            continue
+        covered: list[tuple[int, int]] = []
+        # Longer patterns first so a bare MM-DD inside an ISO date is not
+        # double-counted.
+        for rgx in (_ISO_RE, _DOT_RE, _DASH3_RE, _MD_RE):
+            for m in rgx.finditer(line):
+                s, e = m.span()
+                if any(s >= cs and e <= ce for cs, ce in covered):
+                    continue
+                # Skip dates embedded in a path or filename (slug-MM.DD.YY.md,
+                # dir/2026-01-31-x). Those are records, not pending commitments.
+                before = line[s - 1] if s > 0 else ""
+                after = line[e] if e < len(line) else ""
+                if before in "/-_." or after in "/_-":
+                    continue
+                # Skip record stamps: "(confirmed 06.14.26)", "(status 2026-..)".
+                if _STAMP_RE.search(line[max(0, s - 20):s]):
+                    continue
+                dt = _token_to_date(m.group(), today)
+                if dt is None:
+                    continue
+                covered.append((s, e))
+                if dt < today:
+                    findings.append({
+                        "line": lineno,
+                        "detail": (
+                            f"Line {lineno}: past date {m.group()} with a "
+                            f"future-tense marker (stale commitment?): "
+                            f"{line.strip()[:120]}"
+                        ),
+                    })
+    return findings
+
+
+def check_personal_memory_staleness(
+    memory_dir: Path | None = None, today: date | None = None
+) -> list[dict]:
+    """Scan the personal recall memory dir for stale dated commitments."""
+    base = Path(memory_dir) if memory_dir is not None else PERSONAL_MEMORY_DIR
+    if today is None:
+        today = date.fromisoformat(today_iso())
+    if not base.exists():
+        return []
+    issues = []
+    for md in sorted(base.rglob("*.md")):
+        content = md.read_text(encoding="utf-8")
+        for hit in find_stale_dated_commitments(content, today):
+            issues.append({
+                "severity": "warning",
+                "check": "date_staleness",
+                "file": str(md),
+                "detail": hit["detail"],
+            })
     return issues
 
 
@@ -265,6 +386,7 @@ def main():
         ("Orphan pages", check_orphan_pages),
         ("Orphan sources", check_orphan_sources),
         ("Stale articles", check_stale_articles),
+        ("Date staleness (personal memory)", check_personal_memory_staleness),
         ("Missing backlinks", check_missing_backlinks),
         ("Sparse articles", check_sparse_articles),
     ]
@@ -301,6 +423,19 @@ def main():
     warnings = sum(1 for i in all_issues if i["severity"] == "warning")
     suggestions = sum(1 for i in all_issues if i["severity"] == "suggestion")
     print(f"\nResults: {errors} errors, {warnings} warnings, {suggestions} suggestions")
+
+    # Append a one-line audit entry to workspace-level log.md so the run is
+    # discoverable outside the lint-reports directory. Best-effort; never fails
+    # the run if the append itself errors (read-only fs, permissions, etc.).
+    try:
+        log_path = WORKSPACE_ROOT / "log.md"
+        rel_report = report_path.relative_to(WORKSPACE_ROOT)
+        summary = f"{errors} errors, {warnings} warnings, {suggestions} suggestions"
+        line = f"\n## [{today_iso()}] lint | {summary}; see {rel_report}\n"
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception as exc:
+        print(f"Warning: could not append to log.md: {exc}")
 
     if errors > 0:
         print("\nErrors found - knowledge base needs attention!")
