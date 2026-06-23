@@ -14,6 +14,7 @@ from config import (
     LOG_FILE,
     QA_DIR,
     STATE_FILE,
+    WORKSPACE_ROOT,
 )
 
 
@@ -57,9 +58,19 @@ def extract_wikilinks(content: str) -> list[str]:
 
 
 def wiki_article_exists(link: str) -> bool:
-    """Check if a wikilinked article exists on disk."""
-    path = KNOWLEDGE_DIR / f"{link}.md"
-    return path.exists()
+    """Check if a wikilinked article exists on disk.
+
+    Resolves against the knowledge base first (concepts/connections/qa live
+    there), then against the workspace root, because some wikilinks point at
+    authored notes elsewhere in the vault (e.g. [[StrainBrain/notes/foo]]).
+    Without the workspace fallback the lint reports those as broken when the
+    target actually exists (false positive fixed 2026-06-23).
+    """
+    if (KNOWLEDGE_DIR / f"{link}.md").exists():
+        return True
+    if (WORKSPACE_ROOT / f"{link}.md").exists():
+        return True
+    return False
 
 
 # ── Wiki content helpers ──────────────────────────────────────────────
