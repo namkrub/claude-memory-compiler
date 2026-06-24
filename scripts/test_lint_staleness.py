@@ -101,6 +101,14 @@ def test_still_flags_unstamped_stale_line():
     assert len(find_stale_dated_commitments(content, TODAY)) == 1
 
 
+def test_every_normative_stamp_term_is_skipped():
+    # Locks the rule's status vocabulary to the lint regex. If the rule adds a
+    # stamp term the lint doesn't skip, a compliant entry flags forever.
+    for term in ("RESOLVED", "FALSIFIED", "PARTIAL", "RESCHEDULED", "ARCHIVED"):
+        content = f"Monday 06-22 = agree scope [{term} 06-23: outcome]"
+        assert find_stale_dated_commitments(content, TODAY) == [], term
+
+
 # ── File-scanning wrapper ────────────────────────────────────────────────
 
 def test_check_scans_dir_and_returns_issue_shape(tmp_path: Path):

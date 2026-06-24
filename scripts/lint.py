@@ -162,8 +162,10 @@ _STAMP_RE = re.compile(
 # A line carrying a resolution stamp has already been addressed (per the
 # outcome-on-write rule). Skip it so a preserved prediction does not flag
 # forever. The index hook never carries a stamp, so hooks stay strict.
+# Keep this set in sync with the outcome-on-write rule's status vocabulary;
+# test_every_normative_stamp_term_is_skipped locks the contract.
 _RESOLUTION_STAMP_RE = re.compile(
-    r"\[(?:resolved|done|falsified|rescheduled|archived)\b", re.IGNORECASE
+    r"\[(?:resolved|done|falsified|partial|rescheduled|archived)\b", re.IGNORECASE
 )
 
 _ISO_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")        # 2026-06-22
