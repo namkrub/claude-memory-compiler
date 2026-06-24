@@ -284,6 +284,20 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 - **Frontmatter:** Every article must have YAML frontmatter with at minimum: title, sources, created, updated
 - **Sources:** Always link back to the daily log(s) that contributed to an article
 
+### Outcome-on-write (curated entries only; NOT `daily/`)
+
+When recording an outcome in a `knowledge/` entry, the same edit must do both:
+
+1. **Stamp the body, preserve the prediction.** Mark the pending statement resolved without erasing it. Default `[RESOLVED YYYY-MM-DD: outcome]`; also `[FALSIFIED ...]`, `[PARTIAL ...]`, `[RESCHEDULED ...]`. Preserving the original protects the forecast/falsifier record.
+2. **Rewrite the index hook (`knowledge/index.md` line) to current state only** — no preserved prediction, no stamp; history lives in the body. The hook is the load-bearing artifact.
+
+- **Secret exception (overrides preserve):** redact secret-typed spans in place; never preserve a credential/token/connection string verbatim. Mandatory (no scrub path).
+- **One claim, one state, one line:** each separately-falsifiable claim on its own physical line. The lint's stamp-skip is line-scoped.
+- **This overrides the compiler's default update-in-place** for any entry with a dated prediction or falsifier, even under `acceptEdits`: stamp, do not overwrite.
+- **Archive trigger:** more than two resolution stamps -> consolidate + move history to `Bureau/memory/archive/[slug].md`.
+
+The lint check `check_personal_memory_staleness` (in `scripts/lint.py`) skips resolution-stamped lines and flags past-dated pending language as the backstop. Keep `_RESOLUTION_STAMP_RE` in sync with the stamp vocabulary above.
+
 ---
 
 ## Full Project Structure
