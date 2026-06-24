@@ -159,6 +159,13 @@ _STAMP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A line carrying a resolution stamp has already been addressed (per the
+# outcome-on-write rule). Skip it so a preserved prediction does not flag
+# forever. The index hook never carries a stamp, so hooks stay strict.
+_RESOLUTION_STAMP_RE = re.compile(
+    r"\[(?:resolved|done|falsified|rescheduled|archived)\b", re.IGNORECASE
+)
+
 _ISO_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")        # 2026-06-22
 _DOT_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{2}\b")  # 06.22.26 (workspace std)
 _DASH3_RE = re.compile(r"\b\d{1,2}-\d{1,2}-\d{2}\b")  # 06-22-26
@@ -193,6 +200,8 @@ def find_stale_dated_commitments(content: str, today: date) -> list[dict]:
     """Find lines with a past date next to a future-tense marker."""
     findings = []
     for lineno, line in enumerate(content.splitlines(), start=1):
+        if _RESOLUTION_STAMP_RE.search(line):
+            continue  # already addressed; preserved history is not stale
         if not _MARKER_RE.search(line):
             continue
         covered: list[tuple[int, int]] = []

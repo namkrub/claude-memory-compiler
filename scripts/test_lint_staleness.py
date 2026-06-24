@@ -82,6 +82,25 @@ def test_ignores_confirmed_or_status_date_stamps():
     assert find_stale_dated_commitments(status, TODAY) == []
 
 
+def test_ignores_body_line_with_resolution_stamp():
+    # A preserved prediction marked resolved must not flag forever; otherwise the
+    # lint punishes compliance with the outcome-on-write rule.
+    content = "Monday 06-22 = agree scope [RESOLVED 06-23: meeting happened]"
+    assert find_stale_dated_commitments(content, TODAY) == []
+
+
+def test_ignores_rescheduled_recurring_commitment():
+    # Recurring commitments reset; a reschedule stamp means it was addressed.
+    content = "re-check 06-01 [RESCHEDULED 07-01: recurring]"
+    assert find_stale_dated_commitments(content, TODAY) == []
+
+
+def test_still_flags_unstamped_stale_line():
+    # Regression guard for the stamp logic: no stamp -> still flagged.
+    content = "Monday 06-22 = agree scope with Andy"
+    assert len(find_stale_dated_commitments(content, TODAY)) == 1
+
+
 # ── File-scanning wrapper ────────────────────────────────────────────────
 
 def test_check_scans_dir_and_returns_issue_shape(tmp_path: Path):
