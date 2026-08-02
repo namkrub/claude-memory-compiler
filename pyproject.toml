@@ -7,6 +7,11 @@ dependencies = [
     "claude-agent-sdk>=0.1.29",
     "python-dotenv>=1.0.0",
     "tzdata>=2024.1",
+    # Required by hooks/session-start.py: it imports Bureau/db/load_notes_and_links.py,
+    # which imports parse_frontmatter.py, which imports yaml at module scope. Without
+    # this the SessionStart re-ingest raises ModuleNotFoundError and is swallowed by the
+    # bare except in reingest_and_build_header(), silently freezing the knowledge index.
+    "pyyaml>=6.0",
 ]
 
 [tool.ruff]
