@@ -63,6 +63,83 @@ STALE_INDEX_WARNING = (
     "reflect the most recent successful ingest, not necessarily this session."
 )
 
+# Guard 2 (2026-08-02). The bare except below returned STALE_INDEX_WARNING and
+# nothing else, so a total ingest outage looked identical to a transient blip.
+# A missing PyYAML declaration froze the index for 6 days without a single
+# visible signal. Eugene condition 4 governs SESSION CONTEXT, not disk: the
+# fixed string still goes to context, and the real reason goes here instead.
+INGEST_ERROR_LOG = DB_DIR / "logs" / "knowledge-ingest-errors.log"
+INGEST_ERROR_LOG_MAX_BYTES = 256 * 1024
+
+# Guard 3 (2026-08-02). An undated warning cannot distinguish "failed once,
+# 40 seconds ago" from "frozen since last Monday". Only a value matching this
+# shape is ever interpolated into session context -- anything else falls back
+# to the undated string, so arbitrary DB content can never reach context.
+_ISO_DATE_PREFIX_LEN = 10  # YYYY-MM-DD
+
+
+def _log_ingest_failure(exc: BaseException) -> None:
+    """
+    Append the real failure reason to a local log. Never raises: a failure to
+    log must not escalate into a failure of session start. Rotates by simple
+    truncation so an every-session failure cannot fill the disk.
+    """
+    try:
+        import traceback
+
+        INGEST_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if INGEST_ERROR_LOG.exists() and INGEST_ERROR_LOG.stat().st_size > INGEST_ERROR_LOG_MAX_BYTES:
+            INGEST_ERROR_LOG.write_text("", encoding="utf-8")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with INGEST_ERROR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {stamp} SessionStart re-ingest failed ===\n")
+            fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+
+
+def _last_successful_ingest_date() -> str | None:
+    """
+    Read the date of the last successful ingest for the stale warning. Uses
+    stdlib sqlite3 read-only and touches no Bureau module, so it still works
+    when the failure being reported IS an import failure of those modules.
+    Returns None on anything unexpected, including a value that does not look
+    like an ISO date.
+    """
+    try:
+        import sqlite3
+
+        db_file = DB_DIR / "bureau.db"
+        if not db_file.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT updated_at FROM knowledge_ingest_meta WHERE key = 'corpus_fingerprint'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        candidate = str(row[0])[:_ISO_DATE_PREFIX_LEN]
+        datetime.strptime(candidate, "%Y-%m-%d")  # raises if not a real date
+        return candidate
+    except Exception:
+        return None
+
+
+def _stale_warning() -> str:
+    """STALE_INDEX_WARNING, dated when the date is available and well-formed."""
+    last = _last_successful_ingest_date()
+    if not last:
+        return STALE_INDEX_WARNING
+    return (
+        f"knowledge index may be stale; the last re-ingest attempt failed. "
+        f"Last successful ingest: {last}. "
+        "Query with: python3 Bureau/db/query_knowledge.py '<term>' -- results "
+        "reflect that ingest, not necessarily this session."
+    )
+
 
 def get_recent_log() -> str:
     """Read the most recent daily log (today or yesterday)."""
@@ -133,10 +210,13 @@ def reingest_and_build_header() -> str:
             f"{note_count} notes, {link_count} links. Last ingest: {last_ingest}.\n"
             "Query with: python3 Bureau/db/query_knowledge.py '<term>'"
         )
-    except Exception:
-        # Fixed static string only. Never str(exc), never traceback.format_exc(),
-        # never a path or filename pulled from the exception object.
-        return f"## Knowledge Index\n\n{STALE_INDEX_WARNING}"
+    except Exception as exc:
+        # Session context still gets fixed text only. Never str(exc), never
+        # traceback.format_exc(), never a path or filename pulled from the
+        # exception object. The one added value is a validated YYYY-MM-DD date
+        # read from our own knowledge_ingest_meta row (guard 3).
+        _log_ingest_failure(exc)
+        return f"## Knowledge Index\n\n{_stale_warning()}"
 
 
 def build_context() -> str:
