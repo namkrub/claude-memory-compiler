@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import re
 from datetime import date, timedelta
 from pathlib import Path
@@ -40,6 +41,28 @@ from utils import (
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Canonical, code-controlled check names. Every issue dict carries one of these
+# in issue['check']. The JSON sidecar keys machine-readable counts on this enum,
+# never on free-text detail, so a crafted article body cannot forge a count.
+# Keep in sync with the check_* functions below; the sidecar test locks it.
+CHECK_NAMES = (
+    "broken_link",
+    "orphan_page",
+    "orphan_source",
+    "stale_article",
+    "date_staleness",
+    "missing_backlink",
+    "sparse_article",
+    "contradiction",
+)
+
+# Severity vocabulary emitted by the check functions.
+SEVERITY_NAMES = ("error", "warning", "suggestion")
+
+# Sidecar schema version. Bump when the shape changes so the consumer can refuse
+# a shape it does not understand rather than miscount it.
+SIDECAR_SCHEMA_VERSION = 1
 
 
 def check_broken_links() -> list[dict]:
@@ -398,6 +421,34 @@ def generate_report(all_issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_sidecar(all_issues: list[dict]) -> dict:
+    """Build the machine-readable lint summary from the raw issue dicts.
+
+    This is the machine contract the downstream consumer
+    (melfi-lint-triage-notify.py) counts on. Counts are keyed on the
+    code-controlled issue['check'] enum, NOT on free-text detail, so no crafted
+    article content can inflate, forge, or hide a count. Known checks are
+    pre-seeded to 0 so every count is always present; a check value outside the
+    known enum still appears as its own key, which is the signal the consumer
+    uses to detect producer/consumer vocabulary drift.
+    """
+    check_counts: dict[str, int] = {name: 0 for name in CHECK_NAMES}
+    severity_totals: dict[str, int] = {name: 0 for name in SEVERITY_NAMES}
+    for issue in all_issues:
+        check = str(issue.get("check", "unknown"))
+        check_counts[check] = check_counts.get(check, 0) + 1
+        severity = str(issue.get("severity", "unknown"))
+        severity_totals[severity] = severity_totals.get(severity, 0) + 1
+    return {
+        "schema_version": SIDECAR_SCHEMA_VERSION,
+        "date": today_iso(),
+        "generated_at": now_iso(),
+        "total": len(all_issues),
+        "check_counts": check_counts,
+        "severity_totals": severity_totals,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Lint the knowledge base")
     parser.add_argument(
@@ -436,12 +487,19 @@ def main():
     else:
         print("  Skipping: Contradictions (--structural-only)")
 
-    # Generate and save report
+    # Generate and save report (human-readable) plus the JSON sidecar (machine
+    # contract). The markdown is for humans; the sidecar is what the downstream
+    # triage consumer counts on, keyed on the code-controlled check enum.
     report = generate_report(all_issues)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORTS_DIR / f"lint-{today_iso()}.md"
     report_path.write_text(report, encoding="utf-8")
     print(f"\nReport saved to: {report_path}")
+
+    sidecar = build_sidecar(all_issues)
+    sidecar_path = REPORTS_DIR / f"lint-{today_iso()}.json"
+    sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    print(f"Sidecar saved to: {sidecar_path}")
 
     # Update state
     state = load_state()
