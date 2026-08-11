@@ -343,6 +343,23 @@ Do NOT output anything else - no preamble, no explanation, just the formatted li
     return issues
 
 
+# Report lines have the shape: - **[x]** `file` - detail
+# A backtick in file/detail unbalances the code span the downstream consumer
+# (melfi-lint-triage-notify.py) keys on, and any line-break char splits one
+# finding into several forged, finding-shaped lines. Neither can legitimately
+# appear in a path or a single-line detail, so strip them at the producer. This
+# is the durable fix; the consumer's backtick gate is the second layer. Covers
+# backtick, all C0 controls + DEL, and the Unicode line separators
+# (\x85 \u2028 \u2029) that str.splitlines() breaks on but markdown/git-diff do not.
+_REPORT_FIELD_STRIP_RE = re.compile(r"[`\x00-\x1f\x7f\x85\u2028\u2029]")
+
+
+def _sanitize_report_field(value: str) -> str:
+    """Strip backticks and control/line-break chars from a report field."""
+    cleaned = _REPORT_FIELD_STRIP_RE.sub(" ", str(value))
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
 def generate_report(all_issues: list[dict]) -> str:
     """Generate a markdown lint report."""
     errors = [i for i in all_issues if i["severity"] == "error"]
@@ -369,7 +386,9 @@ def generate_report(all_issues: list[dict]) -> str:
             lines.append("")
             for issue in issues:
                 fixable = " (auto-fixable)" if issue.get("auto_fixable") else ""
-                lines.append(f"- **[{marker}]** `{issue['file']}` - {issue['detail']}{fixable}")
+                safe_file = _sanitize_report_field(issue["file"])
+                safe_detail = _sanitize_report_field(issue["detail"])
+                lines.append(f"- **[{marker}]** `{safe_file}` - {safe_detail}{fixable}")
             lines.append("")
 
     if not all_issues:

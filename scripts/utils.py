@@ -52,9 +52,20 @@ def slugify(text: str) -> str:
 
 # ── Wikilink helpers ──────────────────────────────────────────────────
 
+# A wikilink body may not contain ']' or any line-break character. The negated
+# class excludes every char str.splitlines() breaks on (\n \r \v \f \x1c \x1d
+# \x1e \x85 \u2028 \u2029), not just \n: markdown and git-diff do not break on
+# all of them, so admitting one lets a multi-line "[[link]]" carry a break into
+# the link value. That value is later interpolated into a lint report line, where
+# an embedded break fabricates extra finding-shaped lines and desyncs the parser's
+# line count from a human's. Second layer: _sanitize_report_field in
+# lint.generate_report.
+_WIKILINK_RE = re.compile(r"\[\[([^\]\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+)\]\]")
+
+
 def extract_wikilinks(content: str) -> list[str]:
     """Extract all [[wikilinks]] from markdown content."""
-    return re.findall(r"\[\[([^\]]+)\]\]", content)
+    return _WIKILINK_RE.findall(content)
 
 
 def wiki_article_exists(link: str) -> bool:
