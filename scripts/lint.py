@@ -1,9 +1,8 @@
 """
 Lint the knowledge base for structural and semantic health.
 
-Runs 8 checks: broken links, orphan pages, orphan sources, stale articles,
-date-staleness (personal memory), contradictions (LLM), missing backlinks,
-and sparse articles.
+Runs knowledge-base structural checks, the workspace-routing control checks,
+and an optional contradiction check backed by an LLM.
 
 Usage:
     uv run python lint.py                    # all checks
@@ -14,8 +13,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import re
+import subprocess
+import sys
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -55,6 +58,7 @@ CHECK_NAMES = (
     "missing_backlink",
     "sparse_article",
     "contradiction",
+    "workspace_routing",
 )
 
 # Severity vocabulary emitted by the check functions.
@@ -63,6 +67,81 @@ SEVERITY_NAMES = ("error", "warning", "suggestion")
 # Sidecar schema version. Bump when the shape changes so the consumer can refuse
 # a shape it does not understand rather than miscount it.
 SIDECAR_SCHEMA_VERSION = 1
+
+
+def _routing_module(workspace_root: Path):
+    """Load the workspace routing contract from the live workspace."""
+    module_path = workspace_root / "Bureau" / "tools" / "workspace_routing.py"
+    spec = importlib.util.spec_from_file_location(
+        "workspace_routing_for_memory_lint", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load routing module at {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _routing_failure(workspace_root: Path, detail: str) -> list[dict]:
+    clean = detail.replace("`", "").replace("\n", " ").replace("\r", " ")
+    return [{
+        "severity": "error",
+        "check": "workspace_routing",
+        "file": str(workspace_root / "Bureau" / "config" / "workspace-routes.json"),
+        "detail": f"Workspace route drift: lint adapter failed ({clean}).",
+    }]
+
+
+def check_workspace_routes(workspace_root: Path | None = None) -> list[dict]:
+    """Run the canonical workspace-route validator through its lint adapter."""
+    root = Path(workspace_root or WORKSPACE_ROOT)
+    try:
+        routing = _routing_module(root)
+        return routing.lint_issues(
+            root / "Bureau" / "config" / "workspace-routes.json", root
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _routing_failure(root, str(exc))
+
+
+def check_workspace_write_notices(
+    workspace_root: Path | None = None,
+) -> list[dict]:
+    """Run the class-1 write-notice backstop through the routing contract."""
+    root = Path(workspace_root or WORKSPACE_ROOT)
+    try:
+        routing = _routing_module(root)
+        return routing.notice_backstop_issues(
+            root / "Bureau" / "config" / "workspace-routes.json",
+            root,
+            root / "Bureau" / "review-mailbox",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _routing_failure(root, str(exc))
+
+
+def check_router_render_drift(
+    workspace_root: Path | None = None,
+) -> list[dict]:
+    """Verify that generated CONTEXT.md matches its canonical inputs."""
+    root = Path(workspace_root or WORKSPACE_ROOT)
+    script = root / "Bureau" / "tools" / "render_workspace_router.py"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--check", "--workspace-root", str(root)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _routing_failure(root, str(exc))
+    if proc.returncode == 0:
+        return []
+    detail = (proc.stdout + " " + proc.stderr).strip() or (
+        f"renderer exited {proc.returncode}"
+    )
+    return _routing_failure(root, detail)
 
 
 def check_broken_links() -> list[dict]:
@@ -449,6 +528,22 @@ def build_sidecar(all_issues: list[dict]) -> dict:
     }
 
 
+def structural_checks() -> list[tuple[str, Callable[[], list[dict]]]]:
+    """Return every free structural check run by the live lint command."""
+    return [
+        ("Broken links", check_broken_links),
+        ("Orphan pages", check_orphan_pages),
+        ("Orphan sources", check_orphan_sources),
+        ("Stale articles", check_stale_articles),
+        ("Date staleness (personal memory)", check_personal_memory_staleness),
+        ("Missing backlinks", check_missing_backlinks),
+        ("Sparse articles", check_sparse_articles),
+        ("Workspace routes", check_workspace_routes),
+        ("Workspace write notices", check_workspace_write_notices),
+        ("Workspace router render drift", check_router_render_drift),
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Lint the knowledge base")
     parser.add_argument(
@@ -462,15 +557,7 @@ def main():
     all_issues: list[dict] = []
 
     # Structural checks (free, instant)
-    checks = [
-        ("Broken links", check_broken_links),
-        ("Orphan pages", check_orphan_pages),
-        ("Orphan sources", check_orphan_sources),
-        ("Stale articles", check_stale_articles),
-        ("Date staleness (personal memory)", check_personal_memory_staleness),
-        ("Missing backlinks", check_missing_backlinks),
-        ("Sparse articles", check_sparse_articles),
-    ]
+    checks = structural_checks()
 
     for name, check_fn in checks:
         print(f"  Checking: {name}...")
