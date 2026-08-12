@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -119,6 +120,37 @@ def check_workspace_write_notices(
         )
     except Exception as exc:  # noqa: BLE001
         return _routing_failure(root, str(exc))
+
+
+def check_agent_registry(workspace_root: Path | None = None) -> list[dict]:
+    """Fail scheduled lint when an explicitly claimed agent runtime is lost."""
+    root = Path(workspace_root or WORKSPACE_ROOT)
+    module_path = root / "Bureau" / "tools" / "agent_registry.py"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "agent_registry_for_memory_lint", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load agent registry at {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        issues = []
+        for finding in module.validate_agent_surfaces(root):
+            if finding.severity != "error":
+                continue
+            code = _sanitize_report_field(finding.code)
+            slug = _sanitize_report_field(finding.slug)
+            detail = _sanitize_report_field(finding.detail)
+            issues.append({
+                "severity": "error",
+                "check": "workspace_routing",
+                "file": str(root / "Bureau" / "Team" / "active-agents.json"),
+                "detail": f"Workspace route drift: [{code}] {slug}: {detail}.",
+            })
+        return issues
+    except Exception as exc:  # noqa: BLE001
+        return _routing_failure(root, f"agent registry failed: {exc}")
 
 
 def check_router_render_drift(
@@ -483,14 +515,43 @@ def generate_report(all_issues: list[dict]) -> str:
         ("Warnings", warnings, "!"),
         ("Suggestions", suggestions, "?"),
     ]:
-        if issues:
+        ordinary = [i for i in issues if i.get("check") != "workspace_routing"]
+        if ordinary:
             lines.append(f"## {severity}")
             lines.append("")
-            for issue in issues:
+            for issue in ordinary:
                 fixable = " (auto-fixable)" if issue.get("auto_fixable") else ""
                 safe_file = _sanitize_report_field(issue["file"])
                 safe_detail = _sanitize_report_field(issue["detail"])
                 lines.append(f"- **[{marker}]** `{safe_file}` - {safe_detail}{fixable}")
+            lines.append("")
+
+    routing_issues = [
+        issue for issue in all_issues
+        if issue.get("check") == "workspace_routing"
+    ]
+    if routing_issues:
+        grouped: dict[str, list[dict]] = {}
+        for issue in routing_issues:
+            match = re.search(r"\[([a-z0-9-]+)\]", str(issue.get("detail", "")))
+            code = match.group(1) if match else "adapter-failure"
+            grouped.setdefault(code, []).append(issue)
+        lines.extend([
+            "## Workspace Routing",
+            "",
+            f"**Routing findings:** {len(routing_issues)}",
+            "",
+        ])
+        for code, issues in sorted(grouped.items()):
+            lines.append(f"### `{code}` ({len(issues)})")
+            lines.append("")
+            for issue in sorted(issues, key=lambda item: str(item.get("file", ""))):
+                marker = {"error": "x", "warning": "!"}.get(
+                    issue.get("severity"), "?"
+                )
+                safe_file = _sanitize_report_field(issue["file"])
+                safe_detail = _sanitize_report_field(issue["detail"])
+                lines.append(f"- **[{marker}]** `{safe_file}` - {safe_detail}")
             lines.append("")
 
     if not all_issues:
@@ -500,7 +561,7 @@ def generate_report(all_issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_sidecar(all_issues: list[dict]) -> dict:
+def build_sidecar(all_issues: list[dict], run_id: str | None = None) -> dict:
     """Build the machine-readable lint summary from the raw issue dicts.
 
     This is the machine contract the downstream consumer
@@ -522,6 +583,7 @@ def build_sidecar(all_issues: list[dict]) -> dict:
         "schema_version": SIDECAR_SCHEMA_VERSION,
         "date": today_iso(),
         "generated_at": now_iso(),
+        "run_id": run_id,
         "total": len(all_issues),
         "check_counts": check_counts,
         "severity_totals": severity_totals,
@@ -541,7 +603,15 @@ def structural_checks() -> list[tuple[str, Callable[[], list[dict]]]]:
         ("Workspace routes", check_workspace_routes),
         ("Workspace write notices", check_workspace_write_notices),
         ("Workspace router render drift", check_router_render_drift),
+        ("Agent registry", check_agent_registry),
     ]
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Replace one completed artifact without exposing a partial write."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
 
 def main():
@@ -551,13 +621,29 @@ def main():
         action="store_true",
         help="Skip LLM-based checks (contradictions) - faster and free",
     )
+    parser.add_argument(
+        "--run-id",
+        help="Bind report and sidecar names and metadata to an agent run id",
+    )
+    parser.add_argument("--reports-dir", type=Path, default=REPORTS_DIR,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--contract-issues-json", type=Path,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.run_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
+        parser.error("--run-id must contain only letters, digits, underscore, or hyphen")
 
     print("Running knowledge base lint checks...")
     all_issues: list[dict] = []
 
+    if args.contract_issues_json:
+        loaded = json.loads(args.contract_issues_json.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list):
+            parser.error("--contract-issues-json must contain a JSON array")
+        all_issues = loaded
+
     # Structural checks (free, instant)
-    checks = structural_checks()
+    checks = [] if args.contract_issues_json else structural_checks()
 
     for name, check_fn in checks:
         print(f"  Checking: {name}...")
@@ -566,7 +652,7 @@ def main():
         print(f"    Found {len(issues)} issue(s)")
 
     # LLM check (costs money)
-    if not args.structural_only:
+    if not args.structural_only and not args.contract_issues_json:
         print("  Checking: Contradictions (LLM)...")
         issues = asyncio.run(check_contradictions())
         all_issues.extend(issues)
@@ -578,20 +664,22 @@ def main():
     # contract). The markdown is for humans; the sidecar is what the downstream
     # triage consumer counts on, keyed on the code-controlled check enum.
     report = generate_report(all_issues)
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = REPORTS_DIR / f"lint-{today_iso()}.md"
-    report_path.write_text(report, encoding="utf-8")
+    args.reports_dir.mkdir(parents=True, exist_ok=True)
+    run_suffix = f"-{args.run_id}" if args.run_id else ""
+    report_path = args.reports_dir / f"lint-{today_iso()}{run_suffix}.md"
+    _atomic_write(report_path, report)
     print(f"\nReport saved to: {report_path}")
 
-    sidecar = build_sidecar(all_issues)
-    sidecar_path = REPORTS_DIR / f"lint-{today_iso()}.json"
-    sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    sidecar = build_sidecar(all_issues, run_id=args.run_id)
+    sidecar_path = args.reports_dir / f"lint-{today_iso()}{run_suffix}.json"
+    _atomic_write(sidecar_path, json.dumps(sidecar, indent=2) + "\n")
     print(f"Sidecar saved to: {sidecar_path}")
 
     # Update state
-    state = load_state()
-    state["last_lint"] = now_iso()
-    save_state(state)
+    if not args.contract_issues_json:
+        state = load_state()
+        state["last_lint"] = now_iso()
+        save_state(state)
 
     # Summary
     errors = sum(1 for i in all_issues if i["severity"] == "error")
@@ -602,15 +690,16 @@ def main():
     # Append a one-line audit entry to workspace-level log.md so the run is
     # discoverable outside the lint-reports directory. Best-effort; never fails
     # the run if the append itself errors (read-only fs, permissions, etc.).
-    try:
-        log_path = WORKSPACE_ROOT / "log.md"
-        rel_report = report_path.relative_to(WORKSPACE_ROOT)
-        summary = f"{errors} errors, {warnings} warnings, {suggestions} suggestions"
-        line = f"\n## [{today_iso()}] lint | {summary}; see {rel_report}\n"
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-    except Exception as exc:
-        print(f"Warning: could not append to log.md: {exc}")
+    if not args.contract_issues_json:
+        try:
+            log_path = WORKSPACE_ROOT / "log.md"
+            rel_report = report_path.relative_to(WORKSPACE_ROOT)
+            summary = f"{errors} errors, {warnings} warnings, {suggestions} suggestions"
+            line = f"\n## [{today_iso()}] lint | {summary}; see {rel_report}\n"
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except Exception as exc:
+            print(f"Warning: could not append to log.md: {exc}")
 
     if errors > 0:
         print("\nErrors found - knowledge base needs attention!")
